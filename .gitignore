@@ -1,13 +1,12 @@
-# Python-generated files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 build/
 dist/
-wheels/
 *.egg-info/
-.eggs
+.eggs/
 
 # Virtual environments
 .venv/
@@ -26,7 +25,7 @@ env/
 *.swp
 *.swo
 
-# Testing/coverage
+# Testing & coverage
 .pytest_cache/
 .coverage
 htmlcov/
