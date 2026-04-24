@@ -32,7 +32,7 @@ app/
 
 ## Trying it out (local):
 **Prerequisites:**
-- Python 3.11+
+- Python 3.13+
 - `uv`
 - Gemini Studio API key (paid or free)
 
@@ -44,8 +44,8 @@ cd product-review-analyzer
 uv sync
 
 # Set up environment
-cp .env.example .env
-# Edit .env and add your GEMINI_API_KEY
+touch .env
+# Edit .env and add your GEMINI_API_KEY, and model
 
 # Run
 uv run uvicorn app.main:app --reload
@@ -81,7 +81,7 @@ docker run -p 8000:8000 --env-file .env review-analyzer
 {
   "product_name": "Pixel 9",
   "review_count": 2,
-  "model_used": "gemini-2.0-flash",
+  "model_used": "gemini-flash-latest",
   "analysis": {
     "overall_sentiment": "mixed",
     "sentiment_score": 0.1,
