@@ -1,7 +1,7 @@
 # Product Review Analyzer API
 
-A production-grade REST API that extracts structured intelligence from customer reviews:
-themes, sentiment, pain points and feature requests, powered by Gemini Flash and built with FastAPI.
+A production-grade REST API that extracts structured intelligence from customer reviews — themes, sentiment, 
+pain points, and feature requests — powered by **Gemini 2.0 Flash** with **OpenAI fallback**, built with **FastAPI**.
 
 ## Features:
 - Structured LLM output with Pydantic schema enforcement
@@ -31,10 +31,7 @@ app/
 ```
 
 ## Trying it out (local):
-**Prerequisites:**
-- Python 3.13+
-- `uv`
-- Gemini Studio API key (paid or free)
+**Prerequisites:** Python 3.13+, [uv](https://docs.astral.sh/uv/getting-started/installation/)
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/product-review-analyzer
@@ -44,8 +41,8 @@ cd product-review-analyzer
 uv sync
 
 # Set up environment
-touch .env
-# Edit .env and add your GEMINI_API_KEY, and model
+cp .env.example .env
+# Edit .env — GEMINI_API_KEY is required, OPENAI_API_KEY is optional (fallback)
 
 # Run
 uv run uvicorn app.main:app --reload
@@ -55,15 +52,20 @@ API docs: http://localhost:8000/docs
 
 ---
 
-## Trying it out (Docker):
+## Quick start (Docker)
 
 ```bash
 docker build -t review-analyzer .
 docker run -p 8000:8000 --env-file .env review-analyzer
 ```
 
-## API reference:
+---
+
+## API reference
+
 ### `POST /analyze`
+
+Analyze a batch of customer reviews. Rate limited per client IP.
 
 **Request body:**
 ```json
@@ -81,7 +83,7 @@ docker run -p 8000:8000 --env-file .env review-analyzer
 {
   "product_name": "Pixel 9",
   "review_count": 2,
-  "model_used": "gemini-flash-latest",
+  "model_used": "gemini-2.0-flash",
   "analysis": {
     "overall_sentiment": "mixed",
     "sentiment_score": 0.1,
@@ -97,29 +99,57 @@ docker run -p 8000:8000 --env-file .env review-analyzer
 ```bash
 curl -X POST http://localhost:8000/analyze \
   -H "Content-Type: application/json" \
-  -d '{"reviews": ["Amazing product, love the build quality!", "Too expensive for what it offers."], "product_name": "Widget Pro"}'
+  -d '{
+    "reviews": [
+      "Amazing product, love the build quality!",
+      "Too expensive for what it offers."
+    ],
+    "product_name": "Widget Pro"
+  }'
 ```
 
+**Error responses:**
+
+| Status | Meaning |
+|---|---|
+| `422 Unprocessable Entity` | Request body failed validation |
+| `429 Too Many Requests` | Rate limit exceeded for your IP |
+| `503 Service Unavailable` | All LLM providers are temporarily unavailable |
+
 ### `GET /health`
-Returns `{"status": "ok"}`. Used as a liveness probe by load balancers.
+
+Returns `{"status": "ok"}`. Used as a liveness probe by load balancers and container orchestrators.
 
 ---
 
 ## Key engineering concepts
 
-**Structured LLM output** — `response_schema=GeminiAnalysis` in the
-`GenerateContentConfig` forces Gemini to return JSON matching the Pydantic
-model exactly.
+**Provider fallback chain**
+Requests go to Gemini first. If Gemini fails (error or timeout), the request
+is automatically retried with OpenAI. If both fail, a `503` is returned with
+a human-readable message. Each provider has a hard 10-second timeout enforced
+via `asyncio.wait_for` — a slow provider can't hold the event loop indefinitely.
 
-**Docker layer caching with uv** — dependency files are copied and installed
-*before* source code. A code-only change hits the dependency cache and
-only re-runs the final `COPY app/`. Cold builds are fast because uv is
-10–100× faster than pip.
+**Structured LLM output**
+`response_schema=GeminiAnalysis` in the `GenerateContentConfig` forces Gemini
+to return JSON matching the Pydantic model exactly. No brittle string parsing.
+OpenAI uses `response_format={"type": "json_object"}` and the output is then
+validated against the same Pydantic model.
 
-**JSON logging for the cloud** — every log line is a JSON object with
-`timestamp`, `level`, `status_code`, `latency_ms`, and `request_id`.
-Cloud platforms (GCP, AWS, Azure) index these fields automatically,
-enabling dashboards and alerts without any extra parsing configuration.
+**Rate limiting**
+`slowapi` enforces per-IP request limits using an in-memory counter. The limit
+is configurable via `RATE_LIMIT` in `.env`. For multi-worker deployments,
+replace the default in-memory store with Redis to share counters across processes.
+
+**Docker layer caching with uv**
+Dependency files are copied and installed before source code. A code-only
+change hits the dependency cache — only the final `COPY app/` re-runs.
+
+**JSON logging for the cloud**
+Every log line is a JSON object with `timestamp`, `level`, `status_code`,
+`latency_ms`, and `request_id`. Cloud platforms (GCP, AWS, Azure) index
+these fields automatically, enabling dashboards and alerts without extra
+parsing configuration.
 
 ---
 

@@ -2,25 +2,28 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
-from xml.sax import handler
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from app.config import settings
-from app.llm import ReviewAnalyzer
-from app.schemas import ReviewResponse, ReviewRequest
+from app.llm import AllProvidersFailedError, ReviewAnalyzer
+from app.schemas import ReviewRequest, ReviewResponse
 
-# Structured JSON logging setup ----------------------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Structured JSON logging
+# ---------------------------------------------------------------------------
+
+
 class JSONFormatter(logging.Formatter):
-    """
-    Replaces python's default human-readable log format with single-line JSON (for Cloud logging)
-    """
-
-    # Std LogRecord attributes - skipped when extracting extra fields
     _SKIP = frozenset(
         {
             *logging.LogRecord("", 0, "", 0, "", (), None).__dict__,
@@ -36,7 +39,6 @@ class JSONFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
-        # Merging any extra= fields from the logger call into the JSON object.
         for key, val in record.__dict__.items():
             if key not in self._SKIP and not key.startswith("_"):
                 log[key] = val
@@ -46,67 +48,86 @@ class JSONFormatter(logging.Formatter):
 
 
 def _setup_logging() -> None:
-    handler = logging.StreamHandler()
+    handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JSONFormatter())
     root = logging.getLogger()
-    root.handlers = [handler] # replace any default handlers
+    root.handlers = [handler]
     root.setLevel(settings.LOG_LEVEL)
 
-_setup_logging() # called at import time, before any other module logs anything...
+    # Take over Uvicorn's loggers so all output is JSON
+    for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        uv_logger = logging.getLogger(name)
+        uv_logger.handlers = []
+        uv_logger.propagate = True
+
+
+_setup_logging()
 logger = logging.getLogger(__name__)
 
-# Lifespan: startup / shutdown -----------------------------------------------------------------------------------------
+
+# Rate limiter
+# slowapi's Limiter wraps the `limits` library.
+# key_func=get_remote_address: limits per client IP.
+# This is the right key for a public API — each IP gets its own counter.
+limiter = Limiter(key_func=get_remote_address)
+
+
+
+# Lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    ReviewAnalyzer is created here -once- and attached to app.state.
-    Every request handler can then access it via request.app.state.analyzer without recreating the Gemini client
-    each time.
-    """
-    logger.info("starting up", extra = {"env": settings.APP_ENV, "model": settings.GEMINI_MODEL})
+    logger.info(
+        "starting up",
+        extra={
+            "env": settings.APP_ENV,
+            "model": settings.GEMINI_MODEL,
+            "rate_limit": settings.RATE_LIMIT,
+        },
+    )
     app.state.analyzer = ReviewAnalyzer()
+
+    # slowapi requires the limiter on app.state — it reads it internally
+    # when processing @limiter.limit() decorated routes.
+    # This must happen in lifespan, not at module level, because app.state
+    # isn't available until the app is created.
+    app.state.limiter = limiter
+
     yield
     logger.info("shutting down")
 
-# FastAPI app ----------------------------------------------------------------------------------------------------------
+
+# FastAPI app
 app = FastAPI(
-    title = "Product Review Analyzer",
-    description = (
-        "Extract themes, sentiment, pain points and feature requests from customer reviews using Gemini Flash."
+    title="Product Review Analyzer",
+    description=(
+        "Extract themes, sentiment, pain points, and feature requests "
+        "from customer reviews using Gemini 2.0 Flash with OpenAI fallback."
     ),
-    version= "1.0.0",
-    lifespan=lifespan
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
-# Middleware: request/response logging with latency --------------------------------------------------------------------
+# Register the rate limit exceeded handler.
+# When a client hits the limit, slowapi raises RateLimitExceeded.
+# This handler catches it and returns a clean 429 Too Many Requests response
+# instead of letting it bubble up to the global exception handler as a 500.
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+
+# Middleware
 @app.middleware("http")
 async def logging_middleware(request: Request, call_next):
-    """
-    This wraps every incoming HTTP request.
-
-    The pattern is:
-        start_time = ... <- before the rest of the app runs
-        response = await call_next(request) <- entire stack runs here
-        latency = ... <- after the response is ready
-
-    `call_next(request)` triggers: router lookup -> dependency injection -> Pydantic validation -> the handler ->
-    Pydantic output serialization.
-
-    Everything between start_time and the latency calculation is observed and logged.
-
-    X-Request-ID is injected into every response header so distributed tracing systems can correlate logs to requests.
-    """
-
     request_id = str(uuid.uuid4())
     start = time.perf_counter()
 
     response = await call_next(request)
 
-    latency_ms = round((time.perf_counter() - start) * 1000,2)
+    latency_ms = round((time.perf_counter() - start) * 1000, 2)
 
     logger.info(
         "request",
-        extra = {
+        extra={
             "request_id": request_id,
             "method": request.method,
             "path": request.url.path,
@@ -118,63 +139,71 @@ async def logging_middleware(request: Request, call_next):
     response.headers["X-Request-ID"] = request_id
     return response
 
-# Exception handler ----------------------------------------------------------------------------------------------------
+
+# Global exception handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """
-    Catches any unhandled exception and returns a clean 500.
-    Without this, FastAPI would return the raw python traceback as a string,
-    which leaks internal details and breaks structured JSON logging.
-    """
     logger.error(
-        "unhandled exception",
-        extra = {"path": request.url, "error": str(exc)},
+        "unhandled_exception",
+        extra={"path": request.url.path, "error": str(exc)},
         exc_info=True,
     )
     return JSONResponse(
-        status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content = {"detail": "Internal server error"},
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Internal server error"},
     )
 
-# Routes ---------------------------------------------------------------------------------------------------------------
-@app.get("/health", tags=["Ops"], summary = "Liveness probe")
+
+# Routes
+@app.get("/health", tags=["Ops"], summary="Liveness probe")
 async def health_check():
-    """Returns 200 OK"""
     return {"status": "ok"}
+
 
 @app.post(
     "/analyze",
-    response_model = ReviewResponse,
-    status_code = status.HTTP_200_OK,
-    tags = ["Analysis"],
-    summary = "Analyze customer reviews",
-    description = (
-        "Submit a list of customer review texts. Returns themes, sentiment score, pain points and feature requests."
-    ),
+    response_model=ReviewResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["Analysis"],
+    summary="Analyze customer reviews",
 )
-async def analyze_reviews(payload: ReviewRequest, request: Request):
-    """
-    `payload: ReviewRequest` - FastAPI automatically validates the JSON body against ReviewRequest before this function
-    is called. A 422 is returned automatically if validation fails -> there should never be invalid data.
-
-    `request: Request` - gives access to app.state where the ReviewAnalyzer singleton at the start.
-    """
-
+@limiter.limit(settings.RATE_LIMIT)
+# This decorator reads the limit string from config ("10/minute")
+# and enforces it per IP using the counter stored in app.state.limiter.
+# When the limit is exceeded, RateLimitExceeded is raised automatically
+# and caught by the handler registered above — your code never sees it.
+# IMPORTANT: when using @limiter.limit, `request: Request` MUST be the
+# first parameter. slowapi needs to inspect it to extract the client IP.
+async def analyze_reviews(request: Request, payload: ReviewRequest):
     analyzer: ReviewAnalyzer = request.app.state.analyzer
 
     try:
-        analysis = await analyzer.analyze(payload.reviews, payload.product_name)
-    except Exception as exc:
-        # Catching Gemini API errors (network, quota, etc.) and return 502
-        logger.error("gemini api error", extra = {"error": str(exc)}, exc_info=True)
+        analysis, model_used = await analyzer.analyze(
+            payload.reviews,
+            payload.product_name,
+        )
+    except AllProvidersFailedError:
+        # Every provider was tried and failed.
+        # We already logged warnings per provider in llm.py — no need to log again.
+        # 503: the service is temporarily unavailable (accurate — it's not our fault)
         raise HTTPException(
-            status_code = status.HTTP_502_BAD_GATEWAY,
-            detail = "Failed to analyze reviews. Upstream LLM error."
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Analysis is temporarily unavailable. All providers are down. Please try again later.",
+        )
+    except Exception as exc:
+        logger.error(
+            "unexpected_error",
+            extra={"error": str(exc)},
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Failed to analyze reviews. Unexpected error.",
         )
 
     return ReviewResponse(
-        product_name = payload.product_name,
-        review_count = len(payload.reviews),
-        model_used = analyzer.model,
-        analysis = analysis,
+        product_name=payload.product_name,
+        review_count=len(payload.reviews),
+        model_used=model_used,
+        analysis=analysis,
     )
